@@ -220,6 +220,34 @@ def run_batctl_neighbors():
         pass
     return neighbors
 
+
+def run_iw_station_rssi(ifaces):
+    """Return {mac: {iface: signal_dbm}} from `iw dev <if> station dump`.
+
+    Only the instantaneous `signal:` line per station is read (not the
+    `signal avg:` or ack lines). Missing ifaces or a wedged iw are ignored.
+    """
+    rssi = {}
+    for iface in ifaces:
+        try:
+            # Bound to 5 s per iface in case the driver stalls the dump.
+            r = subprocess.run(['iw', 'dev', iface, 'station', 'dump'],
+                               capture_output=True, text=True, timeout=5)
+        except Exception:
+            continue
+        cur = None
+        for line in r.stdout.splitlines():
+            m = re.match(r'\s*Station ([0-9a-f:]{17})', line)
+            if m:
+                cur = norm_mac(m.group(1))
+                continue
+            if cur:
+                s = re.match(r'\s*signal:\s*(-?[\d.]+)', line)
+                if s:
+                    rssi.setdefault(cur, {})[iface] = float(s.group(1))
+                    cur = None
+    return rssi
+
 def run_batctl_gateways():
     """Return list of {mac, mbps, selected} from `batctl gwl`.
 
@@ -1048,6 +1076,55 @@ def assemble_status_data():
     my_mac     = get_my_mac()
     my_host    = get_my_hostname()
 
+    # Band + RSSI enrichment for the topology view.
+    iw_info      = _iw_dev_info()
+    bat0_active, _, _ = _bat0_slaves()
+    rssi         = run_iw_station_rssi(bat0_active)
+
+    def _iface_mhz(ifname):
+        info = iw_info.get(ifname, {})
+        if info.get('freq_mhz'):
+            return info['freq_mhz']
+        if info.get('freq'):
+            try:
+                return str(round(float(info['freq']) * 1000))
+            except ValueError:
+                return ''
+        return ''
+
+    def _band(mhz):
+        try:
+            f = float(mhz)
+        except (TypeError, ValueError):
+            return ''
+        if f < 1000:
+            return 'halow'
+        if f < 3000:
+            return '2g'
+        return '5g'
+
+    def _iface_band(ifname):
+        # Morse HaLow reports an internal frequency (e.g. 5660 for the 863.5
+        # MHz plan), so detect it by driver rather than by frequency band.
+        try:
+            drv = os.path.basename(os.readlink(
+                f'/sys/class/net/{ifname}/device/driver'))
+        except OSError:
+            drv = ''
+        if 'morse' in drv:
+            return 'halow'
+        return _band(_iface_mhz(ifname))
+
+    ifaces = {}
+    for ifname in bat0_active:
+        info = iw_info.get(ifname, {})
+        ifaces[ifname] = {
+            'band':        _iface_band(ifname),
+            'freq_mhz':    _iface_mhz(ifname),
+            'channel':     info.get('channel', ''),
+            'txpower_dbm': info.get('txpower_dbm', ''),
+        }
+
     neighbor_macs = {n['mac'] for n in neighbors}
     selected_gw   = next((g['mac'] for g in gateways if g['selected']), None)
 
@@ -1129,6 +1206,12 @@ def assemble_status_data():
             'uptime':       fmt_uptime(ndata.get('UPTIME_SECONDS', '')),
             'cpu':          (f"{float(ndata['CPU_LOAD_AVERAGE']):.2f}" if ndata.get('CPU_LOAD_AVERAGE') else ''),
             'battery':      battery,
+            'gps': {
+                'available': bool(ndata.get('GPS_LATITUDE')),
+                'lat':       ndata.get('GPS_LATITUDE', ''),
+                'lon':       ndata.get('GPS_LONGITUDE', ''),
+                'alt':       ndata.get('GPS_ALTITUDE', ''),
+            },
             'mumble':       ndata.get('IS_MUMBLE_SERVER', 'false').lower() == 'true',
             'mediamtx':     ndata.get('IS_MEDIAMTX_SERVER', 'false').lower() == 'true',
             'ntp':          ndata.get('IS_NTP_SERVER', 'false').lower() == 'true',
@@ -1153,6 +1236,7 @@ def assemble_status_data():
             'mbps': None, 'is_me': True, 'is_direct': True,
             'is_gateway': False, 'is_selected_gw': False,
             'uptime': '', 'cpu': '', 'battery': None,
+            'gps': {'available': False, 'lat': '', 'lon': '', 'alt': ''},
             'mumble': False, 'mediamtx': False, 'ntp': False,
             'state': 'ACTIVE', 'ch_2g': '', 'ch_5g': '', 'limp': False,
             'hop_count': None, 'last_seen': str(int(time.time())),
@@ -1160,6 +1244,29 @@ def assemble_status_data():
 
     # Self first, then descending throughput; unknown rates sort last.
     node_list.sort(key=lambda n: (not n['is_me'], -(n['mbps'] if n['mbps'] is not None else -1)))
+
+    # Best direct link from self to each node: iface (band) + measured RSSI.
+    # Used to label edges and sidebar rows; falls back to the originator
+    # iface when the node is not a direct neighbor (multi-hop).
+    for node in node_list:
+        if node.get('is_me'):
+            node['link_iface'] = ''
+            node['link_band'] = ''
+            node['link_rssi'] = None
+            continue
+        macs = set(node.get('all_macs', []))
+        cands = [e for e in neighbors if e['mac'] in macs]
+        iface = max(cands, key=lambda e: e['mbps'])['iface'] if cands \
+            else node.get('best_link', {}).get('iface', '')
+        node['link_iface'] = iface
+        node['link_band'] = ifaces.get(iface, {}).get('band', '')
+        r = None
+        if iface:
+            for m in macs:
+                r = rssi.get(m, {}).get(iface)
+                if r is not None:
+                    break
+        node['link_rssi'] = r
 
     # Build topology edges from batctl o nexthop data
     # mac_to_node_id: every MAC (all interfaces) -> node_id
@@ -1240,6 +1347,20 @@ def assemble_status_data():
                         'mbps':   target_node['mbps'] if target_node else None,
                     })
 
+    # Label each edge with the band + RSSI of the best self->target link.
+    # Inferred peer edges (B->C, neither is self) have no measured link, so
+    # they stay unlabeled rather than showing self's numbers for B's link.
+    for e in edges:
+        tgt = node_by_id.get(e['target'])
+        if e['type'] in ('direct', 'multihop') and tgt:
+            e['iface'] = tgt.get('link_iface', '')
+            e['band']  = tgt.get('link_band', '')
+            e['rssi']  = tgt.get('link_rssi')
+        else:
+            e['iface'] = ''
+            e['band']  = ''
+            e['rssi']  = None
+
     return {
         'nodes':          node_list,
         'my_mac':         my_mac or '',
@@ -1247,6 +1368,7 @@ def assemble_status_data():
         'my_ip':          next((n['ip'] for n in node_list if n.get('is_me')), '') or (state.get('CURRENT_IPV4') or ''),
         'mesh_ssid':      conf.get('mesh_ssid', ''),
         'network':        conf.get('ipv4_network', ''),
+        'ifaces':         ifaces,
         'gateway_count':  len(gateways),  # includes registry fallback
         'selected_gw':    selected_gw or '',
         'neighbors':      neighbors,
@@ -1706,6 +1828,26 @@ function linkPct(mbps) {
   if (mbps == null) return 0;
   return Math.round(Math.min(mbps / LINK_FULL_SCALE_MBPS, 1) * 100);
 }
+// Band of the link carrying a node (2g / 5g / halow). Drives edge color.
+function bandColor(band) {
+  switch (band) {
+    case '2g':    return '#3b82f6'; // blue
+    case '5g':    return '#a855f7'; // purple
+    case 'halow': return '#f59e0b'; // amber
+    default:      return '#9aa4b2'; // gray
+  }
+}
+function bandShort(band) {
+  switch (band) {
+    case '2g':    return '2.4G';
+    case '5g':    return '5G';
+    case 'halow': return 'HaLow';
+    default:      return '';
+  }
+}
+function fmtRssi(rssi) {
+  return rssi == null ? '' : Math.round(rssi) + 'dBm';
+}
 function fmtAge(ts) {
   const secs = (DATA ? DATA.timestamp : Math.floor(Date.now() / 1000)) - parseInt(ts || 0);
   if (secs < 60)   return `${secs}s ago`;
@@ -1744,9 +1886,12 @@ function renderNodeList(nodes) {
     if (n.is_gateway)  badges.push(`<span class="badge badge-gw">${n.is_selected_gw ? '★ GW' : 'GW'}</span>`);
     if (n.is_direct && !n.is_me) badges.push(`<span class="badge badge-direct">DIRECT</span>`);
     if (n.best_link && n.best_link.iface && !n.is_me) {
-      const linkRate = linkLabel(n.best_link.mbps);
-      badges.push(`<span class="badge badge-bestlink" title="BATMAN selected route via ${n.best_link.nexthop || 'unknown'}">BEST ${n.best_link.iface} ${linkRate}</span>`);
+      const band = n.link_band ? bandShort(n.link_band) : n.best_link.iface;
+      const rate = linkLabel(n.best_link.mbps);
+      const rssi = n.link_rssi != null ? ' ' + fmtRssi(n.link_rssi) : '';
+      badges.push(`<span class="badge badge-bestlink" title="BATMAN route via ${n.best_link.nexthop || 'unknown'} on ${n.best_link.iface}">${band} ${rate}${rssi}</span>`);
     }
+    if (n.gps && n.gps.available) badges.push(`<span class="badge badge-svc" title="GPS fix available">GPS</span>`);
     if (n.mumble)      badges.push(`<span class="badge badge-svc">MUMBLE</span>`);
     if (n.mediamtx)    badges.push(`<span class="badge badge-svc">MTX</span>`);
     if (n.ntp)         badges.push(`<span class="badge badge-svc">NTP</span>`);
@@ -1923,6 +2068,8 @@ function initSim(nodes, edges) {
       type:     edge.type,    // 'direct' | 'multihop' | 'inferred' | 'unknown'
       via:      edge.via,     // node id of hop, or null
       mbps:     edge.mbps,
+      band:     edge.band,    // '2g' | '5g' | 'halow' | ''
+      rssi:     edge.rssi,    // dBm measured by self, or null
     });
   });
 }
@@ -2032,7 +2179,9 @@ function drawTopo() {
   sorted_links.forEach(link => {
     const a = link.source, b = link.target;
     const mbps = link.mbps;
-    const col = linkColor(mbps);
+    // Band-colored for measured links (2.4G/5G/HaLow); unlabeled peer edges
+    // fall back to the throughput color.
+    const col = link.band ? bandColor(link.band) : linkColor(mbps);
     const isDirect   = link.type === 'direct';
     const isInferred = link.type === 'inferred';
     const isUnknown  = link.type === 'unknown';
@@ -2063,18 +2212,22 @@ function drawTopo() {
     ctx.stroke();
     ctx.setLineDash([]);
 
-    // Throughput label at midpoint for direct and multihop lines involving self
+    // Throughput + RSSI label at midpoint for direct and multihop lines
+    // involving self. Edge color already encodes the band.
     const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
-    if (mbps != null && (isDirect || link.type === 'multihop')) {
-      ctx.fillStyle = col + 'cc';
+    if ((mbps != null || link.rssi != null) && (isDirect || link.type === 'multihop')) {
+      const parts = [];
+      if (mbps != null)   parts.push(fmtMbps(mbps));
+      if (link.rssi != null) parts.push(Math.round(link.rssi) + 'dB');
+      const label = parts.join(' ');
+      const w = 14 + label.length * 5;
+      ctx.fillStyle = themeColor('#ffffffe8', '#121118e8');
+      ctx.fillRect(mx - w / 2, my - 7, w, 13);
+      ctx.fillStyle = col + 'dd';
       ctx.font = topoFont('700', 9);
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      // Small white backing for readability
-      ctx.fillStyle = themeColor('#ffffffe8', '#121118e8');
-      ctx.fillRect(mx - 12, my - 7, 24, 13);
-      ctx.fillStyle = col + 'dd';
-      ctx.fillText(fmtMbps(mbps), mx, my);
+      ctx.fillText(label, mx, my);
       ctx.textBaseline = 'alphabetic';
     }
 
