@@ -3007,6 +3007,15 @@ CONFIG_TAB_HTML = r"""
       </div>
 
       <div class="cfg-section">
+        <div class="cfg-section-title">Identity</div>
+
+        <div class="cfg-row">
+          <label>Operator Name<span class="hint">Your name / callsign, shown to other nodes on the mesh map. Set per node.</span></label>
+          <input type="text" id="f-operator-name" maxlength="32" autocomplete="off">
+        </div>
+      </div>
+
+      <div class="cfg-section">
         <div class="cfg-section-title">Services</div>
 
         <div class="cfg-row">
@@ -3152,6 +3161,7 @@ function populateForm(cfg) {
   setChk('f-mumble',           cfg.mumble     === 'y');
   setChk('f-auto-update',      cfg.auto_update=== 'y');
   setVal('f-admin-password',   cfg.admin_password    || '');
+  setVal('f-operator-name',    cfg.operator_name     || '');
 }
 
 function setVal(id, v) { const el = document.getElementById(id); if (el) el.value = v; }
@@ -3285,6 +3295,7 @@ function readForm() {
     mumble:            getChk('f-mumble')        ? 'y' : 'n',
     auto_update:       getChk('f-auto-update')   ? 'y' : 'n',
     admin_password:    getVal('f-admin-password'),
+    operator_name:     getVal('f-operator-name'),
   };
 }
 

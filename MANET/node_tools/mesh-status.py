@@ -36,6 +36,7 @@ import os
 import ipaddress
 import socket
 import time
+import math
 import html
 from urllib.parse import urlparse, parse_qs
 
@@ -247,6 +248,15 @@ def run_iw_station_rssi(ifaces):
                     rssi.setdefault(cur, {})[iface] = float(s.group(1))
                     cur = None
     return rssi
+
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    """Great-circle distance in metres between two (lat, lon) in degrees."""
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    a = (math.sin(math.radians(lat2 - lat1) / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2)
+    return 2 * r * math.asin(math.sqrt(a))
 
 def run_batctl_gateways():
     """Return list of {mac, mbps, selected} from `batctl gwl`.
@@ -1193,6 +1203,7 @@ def assemble_status_data():
         node_list.append({
             'id':           nid,
             'hostname':     hostname,
+            'operator':     ndata.get('ATAK_USER', ''),
             'mac':          raw_mac,
             'ip':           ndata.get('IPV4_ADDRESS', ''),
             'mbps':         mbps,
@@ -1231,6 +1242,7 @@ def assemble_status_data():
         node_list.insert(0, {
             'id': 'self',
             'hostname': my_host,
+            'operator': '',
             'mac': my_mac or '',
             'ip': (state.get('CURRENT_IPV4') or ''),
             'mbps': None, 'is_me': True, 'is_direct': True,
@@ -1361,6 +1373,26 @@ def assemble_status_data():
             e['band']  = ''
             e['rssi']  = None
 
+    # Actual GPS separation (haversine) - distinct from the RSSI estimate.
+    def _gps(node):
+        g = node.get('gps', {})
+        try:
+            return float(g.get('lat')), float(g.get('lon'))
+        except (TypeError, ValueError):
+            return None
+    self_gps = _gps(self_node) if self_node else None
+    for node in node_list:
+        g = _gps(node)
+        node['gps_dist_m'] = (round(haversine_m(*self_gps, *g), 1)
+                              if (self_gps and g and not node.get('is_me')) else None)
+    fixed = [(n['id'], _gps(n)) for n in node_list]
+    fixed = [(i, g) for i, g in fixed if g]
+    gps_pairs = []
+    for a in range(len(fixed)):
+        for b in range(a + 1, len(fixed)):
+            (ia, ga), (ib, gb) = fixed[a], fixed[b]
+            gps_pairs.append({'a': ia, 'b': ib, 'm': round(haversine_m(*ga, *gb), 1)})
+
     return {
         'nodes':          node_list,
         'my_mac':         my_mac or '',
@@ -1373,6 +1405,7 @@ def assemble_status_data():
         'selected_gw':    selected_gw or '',
         'neighbors':      neighbors,
         'edges':          edges,
+        'gps_pairs':      gps_pairs,
         'timestamp':      int(time.time()),
     }
 
@@ -1501,6 +1534,16 @@ body {
 .section-hdr { padding: 12px 14px; font-size: 11px; font-weight: 800; letter-spacing: .3px; color: var(--muted); text-transform: none; border-bottom: 1px solid var(--border2); position: sticky; top: 0; background: color-mix(in srgb, var(--surface) 92%, transparent); backdrop-filter: blur(12px); z-index: 1; }
 .node-row { padding: 10px 12px; border-bottom: 1px solid var(--border2); cursor: pointer; transition: background .18s ease, transform .18s ease; }
 .node-row:hover { background: rgba(236,176,0,.08); transform: translateY(-1px); }
+/* Operator / GPS ranges rows */
+.op-row { display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid var(--border2); }
+.op-row.is-me { background: rgba(236,176,0,.06); }
+.op-name { font-weight:700; font-size:12px; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.op-sub { display:block; font-size:10px; color:var(--muted); font-weight:500; }
+.op-dist { font-variant-numeric:tabular-nums; font-weight:800; font-size:12px; color:var(--accent); min-width:52px; text-align:right; }
+.op-pair { display:flex; align-items:center; gap:8px; padding:6px 12px; border-bottom:1px solid var(--border2); font-size:11px; }
+.op-pair span:first-child, .op-pair span:last-child { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.op-pair span:last-child { text-align:right; }
+.op-pair b { font-variant-numeric:tabular-nums; font-weight:800; color:var(--accent); }
 .node-row.is-me { border-left: 2px solid var(--self); }
 .node-row.is-gw { border-left: 2px solid var(--gw); }
 .node-row.is-me.is-gw { border-left: 2px solid var(--gw); }
@@ -1729,7 +1772,11 @@ STATUS_HTML = r"""<!DOCTYPE html>
     </div>
     <div id="drag-handle"></div>
     <div id="side-panel">
-      <div class="section-hdr">MESH NODES <span id="node-count"></span></div>
+      <div class="section-hdr">OPERATORS <span id="op-count"></span></div>
+      <div id="operator-list"></div>
+      <div class="section-hdr" style="margin-top:10px">GPS RANGES</div>
+      <div id="op-pairs"></div>
+      <div class="section-hdr" style="margin-top:10px">MESH NODES <span id="node-count"></span></div>
       <div id="node-list"></div>
     </div>
   </div>
@@ -1957,6 +2004,50 @@ function renderNodeList(nodes) {
       ${detail}
     </div>`;
   }).join('');
+  renderOperatorList();
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Operators + GPS ranges section: per-node operator name and the actual
+// GPS (haversine) separation from this node, plus pairwise GPS ranges.
+function renderOperatorList() {
+  const el = document.getElementById('operator-list');
+  if (!el || !DATA) return;
+  const nodes = DATA.nodes;
+  const cnt = document.getElementById('op-count');
+  if (cnt) cnt.textContent = `(${nodes.length})`;
+  const rows = nodes.map(n => ({
+    n,
+    name: (n.operator && String(n.operator).trim()) || n.hostname || 'node',
+    dist: n.gps_dist_m,
+    fix: !!(n.gps && n.gps.available),
+  }));
+  rows.sort((a, b) => {
+    if (a.n.is_me !== b.n.is_me) return a.n.is_me ? -1 : 1;
+    const da = a.dist == null ? Infinity : a.dist;
+    const db = b.dist == null ? Infinity : b.dist;
+    return da - db;
+  });
+  el.innerHTML = rows.map(({n, name, dist, fix}) => `
+    <div class="op-row ${n.is_me ? 'is-me' : ''}">
+      <div class="op-name">${escapeHtml(name)}${n.is_me ? ' <span class="self-node-badge">ME</span>' : ''}
+        <span class="op-sub">${escapeHtml(n.hostname)} · ${fix ? 'GPS fix' : 'no GPS'}</span></div>
+      <div class="op-dist">${n.is_me ? '' : (dist != null ? fmtDist(dist) : '—')}</div>
+    </div>`).join('');
+
+  const pEl = document.getElementById('op-pairs');
+  if (!pEl) return;
+  const idName = {};
+  nodes.forEach(n => idName[n.id] = (n.operator && String(n.operator).trim()) || n.hostname || n.id);
+  const pairs = (DATA.gps_pairs || []).slice().sort((x, y) => x.m - y.m);
+  pEl.innerHTML = pairs.length
+    ? pairs.map(p => `<div class="op-pair"><span>${escapeHtml(idName[p.a] || p.a)}</span><b>${fmtDist(p.m)}</b><span>${escapeHtml(idName[p.b] || p.b)}</span></div>`).join('')
+    : '<div class="op-sub" style="padding:8px 12px">Need 2+ GPS fixes for pairwise ranges.</div>';
 }
 
 function tickLocalTime() {
@@ -3142,6 +3233,7 @@ def assemble_admin_status():
             'mumble':           conf.get('mumble', 'n'),
             'auto_update':      conf.get('auto_update', 'n'),
             'admin_password':   conf.get('admin_password', ''),
+            'operator_name':    conf.get('operator_name', ''),
         },
         'pending':      pending,
         'rollback':     read_rollback_state(),
