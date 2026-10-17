@@ -1492,6 +1492,9 @@ body {
     0 22px 52px rgba(2,0,13,.08);
 }
 #topo-panel canvas { width: 100%; height: 100%; display: block; touch-action: pan-y pinch-zoom; }
+#topo-view-toggle { position:absolute; top:10px; right:10px; display:flex; gap:3px; padding:3px; background:color-mix(in srgb, var(--surface) 82%, transparent); border:1px solid var(--border2); border-radius:999px; backdrop-filter:blur(8px); z-index:2; }
+.topo-view-btn { border:0; background:transparent; color:var(--muted); font:700 11px/1 var(--font); letter-spacing:.3px; padding:5px 11px; border-radius:999px; cursor:pointer; }
+.topo-view-btn.active { background:var(--accent2); color:var(--fer-black); }
 #side-panel { width: 100%; overflow: visible; border: 1px solid var(--border2); border-radius: 18px; background: var(--surface); box-shadow: 0 18px 44px rgba(2,0,13,.06); }
 
 /* ── Node Table ── */
@@ -1718,6 +1721,10 @@ STATUS_HTML = r"""<!DOCTYPE html>
   <div id="main">
     <div id="topo-panel">
       <canvas id="topo"></canvas>
+      <div id="topo-view-toggle">
+        <button id="view-mesh" class="topo-view-btn active" type="button" onclick="setTopoView('mesh')">Mesh</button>
+        <button id="view-map" class="topo-view-btn" type="button" onclick="setTopoView('map')">Map</button>
+      </div>
       <div id="loading">LOADING TOPOLOGY…</div>
     </div>
     <div id="drag-handle"></div>
@@ -1733,7 +1740,19 @@ __RECOVERY_JS__
 let DATA = null;
 let SIM  = { nodes: [], links: [], running: false, raf: null };
 let HOVER_NODE = null;
+let TOPO_VIEW = 'mesh';   // 'mesh' (force graph) | 'map' (geo / local ranges)
 let drawQueued = false;
+
+function setTopoView(v) {
+  if (TOPO_VIEW === v) return;
+  TOPO_VIEW = v;
+  const m = document.getElementById('view-mesh');
+  const p = document.getElementById('view-map');
+  if (m) m.classList.toggle('active', v === 'mesh');
+  if (p) p.classList.toggle('active', v === 'map');
+  if (typeof view !== 'undefined') { view.x = 0; view.y = 0; view.scale = 1; }
+  scheduleDraw();
+}
 let EXPANDED_NODE_IDS = new Set();
 let LOCAL_DETAIL_HTML = '<div class="peer-loading">Loading…</div>';
 let PEER_DETAIL_CACHE = {};
@@ -2149,6 +2168,179 @@ function simStep() {
 
 const view = { x: 0, y: 0, scale: 1 };
 
+// ── Map view: geographic (GPS) or local ranges (no GPS) ──────────────
+// Distance (m) from RSSI via the log-distance path-loss model (N=2, 0 dBi).
+function rangeFromRssi(rssi, txDbm, fMhz) {
+  if (rssi == null || !txDbm || !fMhz) return null;
+  const fspl1 = 32.44 + 20 * Math.log10(fMhz) - 60; // FSPL at 1 m
+  return Math.pow(10, ((txDbm - fspl1 - rssi) / 20));
+}
+function bandFreqMhz(band, iface) {
+  const f = (DATA && DATA.ifaces && DATA.ifaces[iface]) || {};
+  if (band === 'halow') return 863.5;            // EU 1 MHz plan (US: 907)
+  if (f.freq_mhz) return parseFloat(f.freq_mhz);
+  return band === '5g' ? 5200 : 2437;
+}
+function bandTxDbm(band, iface) {
+  const f = (DATA && DATA.ifaces && DATA.ifaces[iface]) || {};
+  if (f.txpower_dbm) return parseFloat(f.txpower_dbm);
+  return band === 'halow' ? 24 : 30;
+}
+function niceStep(raw) {
+  const p = Math.pow(10, Math.floor(Math.log10(raw)));
+  const m = raw / p;
+  return (m >= 5 ? 5 : m >= 2 ? 2 : 1) * p;
+}
+function fmtDist(m) {
+  if (m == null) return '?';
+  return m < 10 ? m.toFixed(1) + 'm' : m < 1000 ? Math.round(m) + 'm' : (m / 1000).toFixed(2) + 'km';
+}
+function drawMapNode(x, y, n, dim) {
+  const col = dim ? '#9aa4b2' : (n.is_me ? '#ecb000' : (n.is_gateway ? '#ecb000' : bandColor(n.link_band) || linkColor(n.mbps)));
+  const r = n.is_me ? 11 : 8;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fillStyle = themeColor('#ffffff', '#121118'); ctx.fill();
+  ctx.lineWidth = n.is_me ? 2.5 : 1.5; ctx.strokeStyle = col; ctx.stroke();
+  if (n.is_gateway && !dim) { ctx.fillStyle = '#ecb000'; ctx.font = topoFont('700', r); ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText('★', x, y); }
+  else if (n.is_me) { ctx.fillStyle = '#ecb000'; ctx.font = topoFont('700', r); ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText('◉', x, y); }
+  ctx.fillStyle = themeColor('#111827', '#e5e7eb');
+  ctx.font = topoFont(n.is_me ? '800' : '600', 10);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText(n.hostname || 'node', x, y + r + 3);
+  ctx.textBaseline = 'alphabetic';
+}
+function drawMapLink(x1, y1, x2, y2, link) {
+  const col = link.band ? bandColor(link.band) : '#9aa4b2';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+  ctx.strokeStyle = col + (link.type === 'direct' ? 'dd' : '66');
+  ctx.lineWidth = link.type === 'direct' ? 2 : 1.2;
+  ctx.setLineDash(link.type === 'direct' ? [] : [5, 4]);
+  ctx.stroke(); ctx.setLineDash([]);
+  const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+  const parts = [];
+  if (link.mbps != null) parts.push(fmtMbps(link.mbps));
+  if (link.rssi != null) parts.push(Math.round(link.rssi) + 'dB');
+  if (parts.length) {
+    const label = parts.join(' ');
+    const w = 12 + label.length * 5;
+    ctx.fillStyle = themeColor('#ffffffe8', '#121118e8');
+    ctx.fillRect(mx - w / 2, my - 7, w, 13);
+    ctx.fillStyle = col + 'ee'; ctx.font = topoFont('700', 9);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(label, mx, my); ctx.textBaseline = 'alphabetic';
+  }
+}
+
+function drawMapGeo(W, H, nodes, gpsNodes) {
+  const pad = 46;
+  let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+  gpsNodes.forEach(n => {
+    const la = parseFloat(n.gps.lat), lo = parseFloat(n.gps.lon);
+    if (la == null || lo == null) return;
+    minLat = Math.min(minLat, la); maxLat = Math.max(maxLat, la);
+    minLon = Math.min(minLon, lo); maxLon = Math.max(maxLon, lo);
+  });
+  // Guard against a degenerate (single-point) box.
+  const minSpan = 0.0004; // ~45 m
+  if (maxLat - minLat < minSpan) { minLat -= minSpan / 2; maxLat += minSpan / 2; }
+  if (maxLon - minLon < minSpan) { minLon -= minSpan / 2; maxLon += minSpan / 2; }
+  const px = lo => pad + (lo - minLon) / (maxLon - minLon) * (W - 2 * pad);
+  const py = la => H - pad - (la - minLat) / (maxLat - minLat) * (H - 2 * pad);
+
+  // Graticule with labelled, nicely-stepped lines.
+  const latStep = niceStep((maxLat - minLat) / 5);
+  const lonStep = niceStep((maxLon - minLon) / 5);
+  ctx.strokeStyle = themeColor('#00000018', '#ffffff14'); ctx.lineWidth = 1;
+  ctx.fillStyle = themeColor('#00000055', '#ffffff44'); ctx.font = topoFont('500', 8);
+  for (let la = Math.ceil(minLat / latStep) * latStep; la <= maxLat; la += latStep) {
+    const y = py(la); ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(W - pad, y); ctx.stroke();
+    ctx.textAlign = 'left'; ctx.textBaseline = 'bottom'; ctx.fillText(la.toFixed(2) + '°N', pad, y - 2);
+  }
+  for (let lo = Math.ceil(minLon / lonStep) * lonStep; lo <= maxLon; lo += lonStep) {
+    const x = px(lo); ctx.beginPath(); ctx.moveTo(x, pad); ctx.lineTo(x, H - pad); ctx.stroke();
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillText(lo.toFixed(2) + '°E', x, H - pad + 3);
+  }
+  ctx.textBaseline = 'alphabetic';
+
+  const pos = {};
+  gpsNodes.forEach(n => { pos[n.id] = { x: px(parseFloat(n.gps.lon)), y: py(parseFloat(n.gps.lat)) }; });
+
+  SIM.links.forEach(link => {
+    const a = pos[link.source.id], b = pos[link.target.id];
+    if (a && b) drawMapLink(a.x, a.y, b.x, b.y, link);
+  });
+  gpsNodes.forEach(n => { if (pos[n.id]) drawMapNode(pos[n.id].x, pos[n.id].y, n, false); });
+
+  // No-fix nodes in a bottom tray.
+  const nofix = nodes.filter(n => !(n.gps && n.gps.available && n.gps.lat && n.gps.lon));
+  if (nofix.length) {
+    const ty = H - 16;
+    ctx.fillStyle = themeColor('#00000055', '#ffffff44'); ctx.font = topoFont('600', 9);
+    ctx.textAlign = 'left'; ctx.fillText('no GPS fix', pad, ty - 12);
+    nofix.forEach((n, i) => drawMapNode(pad + 14 + i * 34, ty, n, true));
+  }
+}
+
+function drawMapLocal(W, H, nodes) {
+  const cx = W / 2, cy = H / 2;
+  const self = nodes.find(n => n.is_me);
+  const peers = nodes.filter(n => !n.is_me);
+  // Range per peer from its measured RSSI; fall back to the outer ring.
+  let maxR = 0;
+  peers.forEach(p => {
+    p._range = (p.link_rssi != null) ? rangeFromRssi(p.link_rssi, bandTxDbm(p.link_band, p.link_iface), bandFreqMhz(p.link_band, p.link_iface)) : null;
+    if (p._range) maxR = Math.max(maxR, p._range);
+  });
+  if (!maxR) maxR = 10; // default span when nothing measurable
+  const maxPx = Math.min(W, H) / 2 - 40;
+  const k = maxPx / maxR;
+
+  // Range rings.
+  ctx.strokeStyle = themeColor('#00000018', '#ffffff14'); ctx.fillStyle = themeColor('#00000055', '#ffffff44');
+  ctx.font = topoFont('500', 8);
+  [0.33, 0.66, 1].forEach(f => {
+    const rr = maxPx * f;
+    ctx.beginPath(); ctx.arc(cx, cy, rr, 0, Math.PI * 2); ctx.stroke();
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillText(fmtDist(maxR * f), cx, cy - rr - 2);
+  });
+  ctx.textBaseline = 'alphabetic';
+
+  // Place peers on a circle, radius by estimated range, even angles.
+  const step = (Math.PI * 2) / (peers.length || 1);
+  peers.forEach((p, i) => {
+    const ang = -Math.PI / 2 + i * step;
+    const rr = p._range ? Math.max(26, p._range * k) : maxPx;
+    p._mx = cx + Math.cos(ang) * rr;
+    p._my = cy + Math.sin(ang) * rr;
+  });
+  // Links from self.
+  peers.forEach(p => {
+    if (p._mx == null) return;
+    const link = { band: p.link_band, rssi: p.link_rssi, mbps: p.mbps, type: p.is_direct ? 'direct' : 'multihop' };
+    drawMapLink(cx, cy, p._mx, p._my, link);
+    // Range label near the peer.
+    if (p._range) {
+      ctx.fillStyle = themeColor('#111827', '#e5e7eb'); ctx.font = topoFont('700', 9);
+      ctx.textAlign = 'center'; ctx.fillText('≈' + fmtDist(p._range), p._mx, p._my - 14);
+    }
+  });
+  peers.forEach(p => { if (p._mx != null) drawMapNode(p._mx, p._my, p, p._range == null); });
+  if (self) drawMapNode(cx, cy, self, false);
+  ctx.fillStyle = themeColor('#00000066', '#ffffff55'); ctx.font = topoFont('600', 10);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillText('Local view — no shared GPS. Ranges estimated from 2.4 GHz signal.', 12, 10);
+  ctx.textBaseline = 'alphabetic';
+}
+
+function drawMap(W, H) {
+  const nodes = SIM.nodes;
+  if (!nodes.length) return;
+  const gpsNodes = nodes.filter(n => n.gps && n.gps.available && n.gps.lat && n.gps.lon);
+  if (gpsNodes.length >= 2) drawMapGeo(W, H, nodes, gpsNodes);
+  else drawMapLocal(W, H, nodes);
+}
+
 function drawTopo() {
   drawQueued = false;
   const dpr = window.devicePixelRatio || 1;
@@ -2160,6 +2352,8 @@ function drawTopo() {
   ctx.scale(view.scale, view.scale);
 
   ctx.clearRect(-view.x / view.scale, -view.y / view.scale, W / view.scale, H / view.scale);
+
+  if (TOPO_VIEW === 'map') { drawMap(W, H); return; }
 
   if (SIM.nodes.length === 0) return;
 
